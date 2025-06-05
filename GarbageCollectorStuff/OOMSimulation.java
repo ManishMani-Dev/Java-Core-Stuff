@@ -16,7 +16,7 @@ import java.util.ArrayList;
  * <p>
  * <b>Run command to simulate low-memory and enable GC logging:</b>
  * <pre>{@code
- * java -Xms20m -Xmx20m -XX:+PrintGCDetails GarbageCollectorStuff/OOMSimulation.java
+ * java -Xms20m -Xmx20m -XX:+PrintGCDetails GarbageCollectorStuff/OOMSimulation
  * }</pre>
  * <p>
  * JVM flags explained:
