@@ -37,32 +37,49 @@ KEDA does **not replace** the HPA — it **drives** it by feeding custom metrics
 
 ## 2. Core Architecture & Components
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        KEDA Architecture                      │
-│                                                              │
-│  ┌─────────────────┐        ┌──────────────────────────────┐ │
-│  │   ScaledObject  │──────▶│   KEDA Operator (Controller) │ │
-│  │   (CRD)         │        │   - Watches ScaledObjects    │ │
-│  └─────────────────┘        │   - Creates/manages HPA      │ │
-│                              └──────────────┬───────────────┘ │
-│  ┌─────────────────┐                        │                 │
-│  │  ScaledJob      │        ┌───────────────▼───────────────┐ │
-│  │   (CRD)         │        │   Metrics Adapter (Server)    │ │
-│  └─────────────────┘        │   - Exposes custom metrics    │ │
-│                              │   - Feeds data to HPA        │ │
-│  ┌─────────────────┐        └──────────────┬───────────────┘ │
-│  │  TriggerAuth    │                        │                 │
-│  │   (CRD)         │        ┌───────────────▼───────────────┐ │
-│  └─────────────────┘        │   Scalers (50+ integrations)  │ │
-│                              │   - RabbitMQ, Kafka, SQS...   │ │
-│  ┌─────────────────┐        └──────────────┬───────────────┘ │
-│  │ClusterTriggerAuth│                       │                 │
-│  │   (CRD)         │        ┌───────────────▼───────────────┐ │
-│  └─────────────────┘        │   Kubernetes HPA              │ │
-│                              │   - Actually scales the pods  │ │
-│                              └───────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph crds["User-Defined CRDs"]
+        SO["ScaledObject<br/><i>(scale Deployments)</i>"]
+        SJ["ScaledJob<br/><i>(scale Jobs)</i>"]
+        TA["TriggerAuthentication<br/><i>(namespaced creds)</i>"]
+        CTA["ClusterTriggerAuthentication<br/><i>(cluster creds)</i>"]
+    end
+
+    subgraph keda["KEDA Control Plane (keda namespace)"]
+        OP["KEDA Operator<br/>(Controller)<br/>• watches CRDs<br/>• manages HPA<br/>• zero-scale logic"]
+        MA["Metrics Adapter<br/>(external.metrics API server)<br/>• exposes custom metrics"]
+        SC["Scalers (50+)<br/>RabbitMQ · Kafka · SQS · Redis ..."]
+    end
+
+    subgraph k8s["Kubernetes"]
+        HPA["Horizontal Pod Autoscaler"]
+        DEP["Target Deployment / Pods"]
+    end
+
+    EXT[("External Event Source<br/>e.g. RabbitMQ")]
+
+    SO --> OP
+    SJ --> OP
+    TA -.creds.-> OP
+    CTA -.creds.-> OP
+
+    OP -->|creates / manages| HPA
+    OP -->|configures| SC
+    SC -->|queries| EXT
+    SC -->|raw metric| MA
+    MA -->|k8s external metric| HPA
+    HPA -->|scales| DEP
+    OP -.->|patches replicas=0<br/>on zero-scale| DEP
+
+    classDef crd fill:#e3f2fd,stroke:#1976d2,color:#0d47a1;
+    classDef ctrl fill:#fff3e0,stroke:#f57c00,color:#e65100;
+    classDef kube fill:#e8f5e9,stroke:#388e3c,color:#1b5e20;
+    classDef ext fill:#fce4ec,stroke:#c2185b,color:#880e4f;
+    class SO,SJ,TA,CTA crd;
+    class OP,MA,SC ctrl;
+    class HPA,DEP kube;
+    class EXT ext;
 ```
 
 ### 2.1 KEDA Operator
@@ -207,18 +224,40 @@ KEDA ships with 50+ built-in scalers: RabbitMQ, Kafka, AWS SQS, Azure Service Bu
 
 ## 3. How KEDA Works — End-to-End Flow
 
-```
-Every pollingInterval seconds:
+```mermaid
+sequenceDiagram
+    autonumber
+    participant RMQ as RabbitMQ
+    participant SC as KEDA Scaler
+    participant OP as KEDA Operator
+    participant MA as Metrics Adapter
+    participant HPA as Kubernetes HPA
+    participant DEP as Deployment / Pods
 
-  RabbitMQ ──► Scaler ──► Metrics Adapter ──► HPA
-     │             │              │              │
-  queue_depth   raw metric    k8s metric      desired
-   = 450        = 450         = 45.0          replicas
-                              (450/10)         = 45
-                                               │
-                                         Kubernetes
-                                         scales Deployment
-                                         to 45 pods
+    Note over OP: Reads ScaledObject once,<br/>sets up polling loop
+
+    loop Every pollingInterval (e.g. 10s)
+        SC->>RMQ: GET queue stats (Mgmt API)
+        RMQ-->>SC: messages_ready = 450
+        SC->>MA: raw metric = 450
+        MA->>HPA: external metric = 450 (target 10/pod)
+        HPA->>HPA: desired = ceil(450 / 10) = 45
+        HPA->>DEP: scale to 45 replicas
+        DEP-->>HPA: current replicas updated
+    end
+
+    alt messages_ready == 0 AND minReplicaCount == 0
+        Note over OP,DEP: After cooldownPeriod expires
+        OP->>DEP: patch replicas = 0 (bypass HPA min)
+    end
+```
+
+```mermaid
+flowchart LR
+    A["RabbitMQ<br/>queue_depth = 450"] --> B["Scaler<br/>raw metric = 450"]
+    B --> C["Metrics Adapter<br/>k8s metric = 450"]
+    C --> D["HPA<br/>ceil(450 / 10) = 45"]
+    D --> E["Kubernetes scales<br/>Deployment → 45 pods"]
 ```
 
 **Step-by-step:**
@@ -250,6 +289,23 @@ http://user:password@rabbitmq-host:15672/vhost
 ```
 
 The HTTP mode gives access to more queue statistics.
+
+```mermaid
+flowchart TB
+    subgraph scaler["RabbitMQ Scaler"]
+        direction TB
+        AUTH{"protocol?"}
+    end
+
+    SEC[("Kubernetes Secret<br/>connectionString")] -.via TriggerAuth.-> AUTH
+    AUTH -->|amqp| AMQP["AMQP :5672<br/>direct queue connection<br/>(QueueLength only)"]
+    AUTH -->|http| HTTP["HTTP Mgmt API :15672<br/>richer stats<br/>(QueueLength + MessageRate)"]
+    AMQP --> RMQ[("RabbitMQ Broker")]
+    HTTP --> RMQ
+
+    classDef ext fill:#fce4ec,stroke:#c2185b,color:#880e4f;
+    class RMQ,SEC ext;
+```
 
 ---
 
@@ -305,17 +361,29 @@ This is KEDA's most powerful feature. Native HPA cannot scale below 1.
 
 ### 5.1 How Zero-Scale Works
 
-```
-Queue empty (messages = 0):
-  KEDA Operator sees activationValue not exceeded
-  → Bypasses HPA
-  → Directly patches Deployment replicas to 0
-  → HPA is paused/disabled
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
 
-Queue has messages (messages > activationValue):
-  KEDA Operator re-enables HPA
-  → Patches Deployment replicas to at least 1
-  → HPA takes over and scales to desired count
+    Idle: Idle (0 replicas)
+    note right of Idle
+        HPA paused.
+        KEDA Operator polls the queue.
+    end note
+
+    Active: Active (1..N replicas)
+    note right of Active
+        HPA in control.
+        desired = ceil(messages / value)
+    end note
+
+    Draining: Draining (cooldown timer)
+
+    Idle --> Active: messages > activationValue<br/>(Operator patches replicas → 1)
+    Active --> Active: queue grows / shrinks<br/>(HPA scales N)
+    Active --> Draining: messages == 0
+    Draining --> Active: messages > activationValue<br/>(timer cancelled)
+    Draining --> Idle: cooldownPeriod elapsed<br/>(Operator patches replicas → 0)
 ```
 
 ### 5.2 Configuration
@@ -431,10 +499,20 @@ spec:
 ```
 
 **Timeline:**
-```
-T=0:00  Queue drains to 0 messages
-T=0:00  KEDA notes queue is empty — starts cooldown timer
-T=5:00  Cooldown expires → KEDA scales Deployment to 0 replicas
+
+```mermaid
+sequenceDiagram
+    participant Q as Queue
+    participant K as KEDA Operator
+    participant D as Deployment
+
+    Q->>K: messages_ready → 0  (T=0:00)
+    Note over K: start cooldown timer (300s)
+    rect rgb(255, 245, 230)
+        Note over K,D: pods stay alive, draining in-flight work
+    end
+    Note over K: T=5:00 cooldown expires
+    K->>D: scale replicas → 0
 ```
 
 ### 7.2 HPA-Level `stabilizationWindowSeconds` for Scale-Down
@@ -551,6 +629,34 @@ k8s/
 ├── trigger-auth.yaml
 ├── consumer-deployment.yaml
 └── scaledobject.yaml
+```
+
+### How These Resources Connect
+
+```mermaid
+flowchart TB
+    SECRET[("rabbitmq-secret<br/>(Secret: host)")]
+    TAUTH["rabbitmq-trigger-auth<br/>(TriggerAuthentication)"]
+    SOBJ["order-consumer-scaler<br/>(ScaledObject)<br/>min 0 · max 30 · poll 10s"]
+    DEPLOY["order-consumer<br/>(Deployment)"]
+    HPA["keda-hpa-order-consumer-scaler<br/>(auto-created HPA)"]
+    PODS["order-consumer pods<br/>0 ↔ 30"]
+    RMQ[("RabbitMQ<br/>order-queue")]
+
+    SECRET -->|secretTargetRef| TAUTH
+    SECRET -.env RABBITMQ_URL.-> DEPLOY
+    TAUTH -->|authenticationRef| SOBJ
+    SOBJ -->|scaleTargetRef| DEPLOY
+    SOBJ -->|manages| HPA
+    SOBJ -->|trigger: rabbitmq| RMQ
+    HPA -->|scales| PODS
+    DEPLOY --> PODS
+    PODS -->|consume| RMQ
+
+    classDef ext fill:#fce4ec,stroke:#c2185b,color:#880e4f;
+    classDef cfg fill:#e3f2fd,stroke:#1976d2,color:#0d47a1;
+    class RMQ,SECRET ext;
+    class TAUTH,SOBJ cfg;
 ```
 
 ### 9.2 Step 1 — Create the RabbitMQ Connection Secret
@@ -835,33 +941,31 @@ Check that:
 
 ## Summary Flow Diagram
 
-```
-Messages arrive in RabbitMQ queue
-        │
-        ▼
-KEDA polls every pollingInterval (e.g., 10s)
-        │
-        ├─ messages == 0 AND replicas > 0
-        │         │
-        │    cooldownPeriod timer starts
-        │         │
-        │    timer expires → scale to 0 replicas
-        │
-        ├─ messages > 0 AND replicas == 0
-        │         │
-        │    activationValue exceeded?
-        │         ├─ No  → stay at 0
-        │         └─ Yes → scale to 1, hand off to HPA
-        │
-        └─ messages > 0 AND replicas >= 1
-                  │
-             HPA computes:
-             desiredReplicas = ceil(messages / value)
-                  │
-             Apply scaleUp policy (fast) ──► if growing
-             Apply scaleDown policy (slow) ─► if shrinking
-                  │
-             Kubernetes adjusts pod count
+```mermaid
+flowchart TD
+    START["Messages arrive in RabbitMQ queue"] --> POLL["KEDA polls every<br/>pollingInterval (e.g. 10s)"]
+
+    POLL --> C1{"messages == 0<br/>AND replicas > 0?"}
+    C1 -->|Yes| COOL["cooldownPeriod timer starts"]
+    COOL --> ZERO["timer expires →<br/>scale to 0 replicas"]
+
+    POLL --> C2{"messages > 0<br/>AND replicas == 0?"}
+    C2 -->|Yes| ACT{"activationValue<br/>exceeded?"}
+    ACT -->|No| STAY["stay at 0"]
+    ACT -->|Yes| WAKE["scale to 1,<br/>hand off to HPA"]
+
+    POLL --> C3{"messages > 0<br/>AND replicas >= 1?"}
+    C3 -->|Yes| CALC["HPA computes:<br/>desiredReplicas = ceil(messages / value)"]
+    CALC --> DIR{"growing or<br/>shrinking?"}
+    DIR -->|growing| UP["apply scaleUp policy (fast)"]
+    DIR -->|shrinking| DOWN["apply scaleDown policy (slow)"]
+    UP --> ADJ["Kubernetes adjusts pod count"]
+    DOWN --> ADJ
+
+    classDef zero fill:#ffebee,stroke:#c62828,color:#b71c1c;
+    classDef go fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+    class ZERO,STAY zero;
+    class WAKE,ADJ go;
 ```
 
 ---
